@@ -1,0 +1,475 @@
+From db8b39600caaa00665f6f2aecdee331917fd1ccb Mon Sep 17 00:00:00 2001
+From: Jun Zeng <jun1.zeng@intel.com>
+Date: Mon, 24 Nov 2025 11:37:31 +0800
+Subject: [PATCH] Adaptive NVME SSD interrupt coalescing
+
+This is to solve NVME SSD interrupt burst:
+If SSD iops reach a certain pressure level, enable coalescing interrupt;
+else disable coalescing interrupt.
+
+Signed-off-by: Jun Zeng <jun1.zeng@intel.com>
+Signed-off-by: Liang Fang <liang.a.fang@intel.com>
+---
+ drivers/nvme/host/pci.c | 360 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 360 insertions(+)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index ce129655ef0a..aecd002e6328 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -26,6 +26,7 @@
+ #include <linux/io-64-nonatomic-hi-lo.h>
+ #include <linux/sed-opal.h>
+ #include <linux/pci-p2pdma.h>
++#include <linux/printk.h>
+ 
+ #include "trace.h"
+ #include "nvme.h"
+@@ -153,6 +154,14 @@ struct nvme_dev {
+ 	unsigned int nr_allocated_queues;
+ 	unsigned int nr_write_queues;
+ 	unsigned int nr_poll_queues;
++	/* related definition for adaptive interrupt coalescing */
++	int is_coalescing;
++	int pressure_cnt; /* continous count for state under pressure */
++	int less_pressure_cnt; /* continous count for state under no pressure */
++	u64 last_total_io_num;
++	ktime_t last_check_time;
++	struct delayed_work coalesce_work;
++	unsigned long *active_q_bitmap;
+ };
+ 
+ static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
+@@ -214,6 +223,7 @@ struct nvme_queue {
+ 	u32 *dbbuf_sq_ei;
+ 	u32 *dbbuf_cq_ei;
+ 	struct completion delete_done;
++	u64 io_cnt;/* to count io number of this queue for interrupt coalescing adaptive configuring. */
+ };
+ 
+ /*
+@@ -907,6 +917,285 @@ static blk_status_t nvme_map_metadata(struct nvme_dev *dev, struct request *req,
+ 	return BLK_STS_OK;
+ }
+ 
++static int nvme_set_irq_coalesce(struct nvme_ctrl *ctrl, u32 v)
++{
++	return nvme_set_features(ctrl, NVME_FEAT_IRQ_COALESCE, v, NULL, 0, NULL);
++}
++
++static int nvme_get_irq_coalesce(struct nvme_ctrl *ctrl, u32 *v)
++{
++	return nvme_get_features(ctrl, NVME_FEAT_IRQ_COALESCE, 0, NULL, 0, v);
++}
++
++static bool nvme_check_irq_coalesce_supported(struct nvme_ctrl *ctrl)
++{
++	u32 value;
++	int ret;
++	struct nvme_ns *ns;
++
++	ret = nvme_get_irq_coalesce(ctrl, &value);
++	if (ret != 0) {
++		ns = list_first_entry_or_null(&ctrl->namespaces, struct nvme_ns, list);
++		pr_info("interrupt coalescing not supported by %s.\n",
++				ns ? ns->disk->disk_name : "NULL");
++		return false;
++	}
++	return true;
++}
++
++/*
++ * coalescing interrupt control
++ */
++#define SCAN_INTERVAL_MS 100 /* 100 ms */
++#define PRESSURE_HIGH_THRESHOLD  50000 /* 50k io num, for 100 ms */
++#define HIT_COUNT_BEFORE_CHANGE_DEFAULT 5	/* condition hit count before change */
++#define CHECK_INTERVAL                  0x1FF    /* check interval */
++
++static int disable = 0;
++module_param(disable, uint, 0444);
++MODULE_PARM_DESC(disable,
++	"whether to disable the adaptive interrupt coalescing feature, 1 for disable, 0 for not disable, default is 0.");
++
++static int check_interval = CHECK_INTERVAL;
++static int switch_cnt = 0;
++static int hit_count_before_change = HIT_COUNT_BEFORE_CHANGE_DEFAULT;
++static int coalesce_value = 0x10a;
++static int high_io_delta = PRESSURE_HIGH_THRESHOLD;
++static int scan_interval = SCAN_INTERVAL_MS;
++static int min_running_queues = 2;
++
++static ssize_t disable_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	return sprintf(buf, "%d\n", disable);
++}
++
++static ssize_t disable_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
++	int v = 0;
++	int ret = kstrtoint(buf, 10, &v);
++	if (0 == v || 1 == v)
++		disable = v;
++
++	if (1 == v)
++		switch_cnt = 0;
++
++	return ret ?: count;
++}
++
++static ssize_t check_interval_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	return sprintf(buf, "%d\n", check_interval);
++}
++
++static ssize_t check_interval_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
++	int v = 0;
++	int ret = kstrtoint(buf, 10, &v);
++	check_interval = v;
++
++	return ret ?: count;
++}
++
++static ssize_t switch_cnt_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	return sprintf(buf, "%d\n", switch_cnt);
++}
++
++static ssize_t switch_cnt_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
++	int v = 0;
++	int ret = kstrtoint(buf, 10, &v);
++	if(v >= 0)
++		switch_cnt = v;
++	return ret ?: count;
++}
++
++static ssize_t coalesce_value_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	return sprintf(buf, "%d\n", coalesce_value);
++}
++
++static ssize_t coalesce_value_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
++	int v = 0;
++	int ret = kstrtoint(buf, 10, &v);
++	if(v > 0)
++		coalesce_value = v;
++	return ret ?: count;
++}
++
++static ssize_t hit_count_before_change_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	return sprintf(buf, "%d\n", hit_count_before_change);
++}
++
++static ssize_t hit_count_before_change_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
++	int v = 0;
++	int ret = kstrtoint(buf, 10, &v);
++	if(v > 0)
++		hit_count_before_change = v;
++	return ret ?: count;
++}
++
++static ssize_t high_io_delta_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	return sprintf(buf, "%d\n", high_io_delta);
++}
++
++static ssize_t high_io_delta_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
++	int v = 0;
++	int ret = kstrtoint(buf, 10, &v);
++	if(0<=v)
++		high_io_delta = v;
++	return ret ?: count;
++}
++
++static ssize_t scan_interval_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	return sprintf(buf, "%d\n", scan_interval);
++}
++
++static ssize_t scan_interval_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
++	int v = 0;
++	int ret = kstrtoint(buf, 10, &v);
++	if(0<=v) {
++		scan_interval = v;
++		high_io_delta = PRESSURE_HIGH_THRESHOLD * scan_interval / SCAN_INTERVAL_MS;
++	}
++	return ret ?: count;
++}
++
++static ssize_t min_running_queues_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
++	return sprintf(buf, "%d\n", min_running_queues);
++}
++
++static ssize_t min_running_queues_store(struct kobject *kobj, struct kobj_attribute *attr, const char *buf, size_t count) {
++	int v = 0;
++	int ret = kstrtoint(buf, 10, &v);
++	if(1 <= v)
++		min_running_queues = v;
++	return ret ?: count;
++}
++
++static struct kobj_attribute disable_attr = __ATTR(disable, 0644, disable_show, disable_store);
++static struct kobj_attribute check_interval_attr = __ATTR(check_interval, 0644, check_interval_show, check_interval_store);
++static struct kobj_attribute switch_cnt_attr = __ATTR(switch_cnt, 0644, switch_cnt_show, switch_cnt_store);
++static struct kobj_attribute coalesce_value_attr = __ATTR(coalesce_value, 0644, coalesce_value_show, coalesce_value_store);
++static struct kobj_attribute hit_count_before_change_attr = __ATTR(hit_count_before_change, 0644, hit_count_before_change_show, hit_count_before_change_store);
++static struct kobj_attribute high_io_delta_attr = __ATTR(high_io_delta, 0644, high_io_delta_show, high_io_delta_store);
++static struct kobj_attribute scan_interval_attr = __ATTR(scan_interval, 0644, scan_interval_show, scan_interval_store);
++static struct kobj_attribute min_running_queues_attr = __ATTR(min_running_queues, 0644, min_running_queues_show, min_running_queues_store);
++
++static inline void adjust_coalesce(struct nvme_dev *dev)
++{
++	u64 now = ktime_get_ns();
++	u64 time_interval;
++	u64 total_io = 0;
++	u64 io_delta = 0;
++	struct nvme_queue *nvmeq;
++	struct nvme_ns *ns;
++	int i;
++	int running_queues;
++
++	if (unlikely(disable)) {
++		/* clear the coalescing configuration when disable set */
++		dev->pressure_cnt = 0;
++		dev->less_pressure_cnt += hit_count_before_change;
++		time_interval = 0;
++		io_delta = 0;
++		running_queues = 1;
++		ns = list_first_entry_or_null(&dev->ctrl.namespaces, struct nvme_ns, list);
++		pr_info("clear coalesce, name:%s, for disable been set.\n",
++			ns ? ns->disk->disk_name : "NULL");
++		goto do_check;
++	}
++
++	running_queues = bitmap_weight(dev->active_q_bitmap, dev->nr_allocated_queues);
++	if (running_queues == 0) {
++		dev->last_check_time = now;
++		return;
++	}
++
++	time_interval = ktime_to_ns(ktime_sub(now, dev->last_check_time));
++	dev->last_check_time = now;
++
++	/* we can not only loop the active queue, because we should caculate the
++	 * io delta with the last_total_io_num. The active queue bitmap just to
++	 * identify the idle cycle quickly. */
++	for (i = dev->nr_allocated_queues - 1; i > 0; i--) {
++		nvmeq = &dev->queues[i];
++		total_io += nvmeq->io_cnt;
++	}
++	bitmap_zero(dev->active_q_bitmap, dev->nr_allocated_queues);
++	io_delta = total_io - dev->last_total_io_num;
++	dev->last_total_io_num = total_io;
++
++	/* the delayed work not that accurate, so adjust the threshold
++	 * according to the real interval */
++	if (io_delta * scan_interval * 1000000 > high_io_delta * time_interval &&
++		running_queues >= min_running_queues) {
++		dev->pressure_cnt ++;
++		dev->less_pressure_cnt = 0;
++	} else {
++		dev->less_pressure_cnt ++;
++		dev->pressure_cnt = 0;
++	}
++
++do_check:
++	if ((dev->is_coalescing == 0) && dev->pressure_cnt > hit_count_before_change) {
++		 if (!nvme_set_irq_coalesce(&dev->ctrl, coalesce_value)) {
++			 ns = list_first_entry_or_null(&dev->ctrl.namespaces, struct nvme_ns, list);
++			 pr_info("set coalesce, name:%s, with up_cnt:%d, io_delta:"
++					 "%llu, time_interval:%llu ns, total_io_num:%llu, running_queues:%d\n",
++					 ns ? ns->disk->disk_name : "NULL",
++					 dev->pressure_cnt, io_delta,
++					 time_interval, total_io, running_queues);
++			 dev->is_coalescing = 1;
++			 dev->pressure_cnt = 0;
++			 dev->less_pressure_cnt = 0;
++			 switch_cnt++;
++		 }
++	} else if ((dev->is_coalescing == 1) &&
++			dev->less_pressure_cnt > hit_count_before_change) {
++		if (!nvme_set_irq_coalesce(&dev->ctrl, 0x100)) {
++			ns = list_first_entry_or_null(&dev->ctrl.namespaces, struct nvme_ns, list);
++			pr_info("clear coalesce, name:%s, with down_cnt:%d, io_delta:"
++					 "%llu, time_interval:%llu ns, total_io_num:%llu, running_queues:%d\n",
++					 ns ? ns->disk->disk_name : "NULL",
++					 dev->less_pressure_cnt, io_delta,
++					 time_interval, total_io, running_queues);
++			 dev->is_coalescing = 0;
++			 dev->pressure_cnt = 0;
++			 dev->less_pressure_cnt = 0;
++			 switch_cnt++;
++		}
++	}
++}
++
++void nvme_adjust_coalesce_work(struct work_struct *work)
++{
++	struct nvme_dev *dev = container_of(work, struct nvme_dev, coalesce_work.work);
++	int node = dev_to_node(dev->dev);
++	int cpu = cpumask_last(cpumask_of_node(node));
++
++	if (unlikely(disable) && (dev->is_coalescing == 0)) {
++		goto out;
++	}
++
++	adjust_coalesce(dev);
++out:
++	schedule_delayed_work_on(cpu, &dev->coalesce_work, msecs_to_jiffies(scan_interval));
++}
++
++void nvme_mark_queue_active(struct nvme_queue *nvmeq, u16 sq_tail)
++{
++	if (unlikely(disable))
++		return;
++
++	if (nvmeq->qid == 0) /* ignore admin op */
++		return;
++
++	if ((sq_tail & check_interval) == 0) {
++		set_bit(nvmeq->qid, nvmeq->dev->active_q_bitmap);
++	}
++}
++
++/* there is no bitmap_zalloc_node for linux-5.10 kernel version, just construct one here */
++unsigned long *bitmap_zalloc_node(unsigned int nbits, gfp_t flags, int node)
++{
++	return kmalloc_array_node(BITS_TO_LONGS(nbits), sizeof(unsigned long),
++			flags | __GFP_ZERO, node);
++}
++
+ /*
+  * NOTE: ns is NULL when called on the admin queue.
+  */
+@@ -948,6 +1237,7 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 			goto out_unmap_data;
+ 	}
+ 
++	nvme_mark_queue_active(nvmeq, nvmeq->sq_tail+1);
+ 	blk_mq_start_request(req);
+ 	nvme_submit_cmd(nvmeq, cmnd, bd->last);
+ 	return BLK_STS_OK;
+@@ -1021,6 +1311,8 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq, u16 idx)
+ 		return;
+ 	}
+ 
++	++ nvmeq->io_cnt;
++
+ 	trace_nvme_sq(req, cqe->sq_head, nvmeq->sq_tail);
+ 	if (!nvme_try_complete_req(req, cqe->status, cqe->result))
+ 		nvme_pci_complete_rq(req);
+@@ -1526,6 +1818,7 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
+ 	nvmeq->cq_phase = 1;
+ 	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
+ 	nvmeq->qid = qid;
++	nvmeq->io_cnt = 0;
+ 	dev->ctrl.queue_count++;
+ 
+ 	return 0;
+@@ -2571,6 +2864,8 @@ static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
+ 	free_opal_dev(dev->ctrl.opal_dev);
+ 	mempool_destroy(dev->iod_mempool);
+ 	put_device(dev->dev);
++	cancel_delayed_work_sync(&dev->coalesce_work);
++	bitmap_free(dev->active_q_bitmap);
+ 	kfree(dev->queues);
+ 	kfree(dev);
+ }
+@@ -2867,6 +3162,14 @@ static void nvme_async_probe(void *data, async_cookie_t cookie)
+ 
+ 	flush_work(&dev->ctrl.reset_work);
+ 	flush_work(&dev->ctrl.scan_work);
++	if (nvme_check_irq_coalesce_supported(&dev->ctrl) &&
++		!unlikely(disable)) {
++		schedule_delayed_work_on(cpumask_last(cpumask_of_node(dev_to_node(dev->dev))),
++			&dev->coalesce_work, msecs_to_jiffies(scan_interval));
++	} else {
++		dev_warn(dev->ctrl.device, "irq coalesce feature not supported or not to enable"
++				" adaptive irq coalesce, with disable = %d\n", disable);
++	}
+ 	nvme_put_ctrl(&dev->ctrl);
+ }
+ 
+@@ -2885,6 +3188,12 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (!dev)
+ 		return -ENOMEM;
+ 
++	dev->is_coalescing = 0;
++	dev->pressure_cnt = 0;
++	dev->less_pressure_cnt = 0;
++	dev->last_total_io_num = 0;
++	dev->last_check_time = ktime_get_ns();
++
+ 	dev->nr_write_queues = write_queues;
+ 	dev->nr_poll_queues = poll_queues;
+ 	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
+@@ -2941,6 +3250,13 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	if (result)
+ 		goto release_mempool;
+ 
++	dev->active_q_bitmap = bitmap_zalloc_node(dev->nr_allocated_queues, GFP_KERNEL, node);
++	if (!dev->active_q_bitmap) {
++		result = -ENOMEM;
++		goto release_mempool;
++	}
++	INIT_DELAYED_WORK(&dev->coalesce_work, nvme_adjust_coalesce_work);
++
+ 	dev_info(dev->ctrl.device, "pci function %s\n", dev_name(&pdev->dev));
+ 
+ 	nvme_reset_ctrl(&dev->ctrl);
+@@ -3287,8 +3603,42 @@ static struct pci_driver nvme_driver = {
+ 	.err_handler	= &nvme_err_handler,
+ };
+ 
++static struct kobject *nvme_kobj;
++
+ static int __init nvme_init(void)
+ {
++	int ret;
++	nvme_kobj = kobject_create_and_add("nvme", kernel_kobj);
++	if (!nvme_kobj) {
++		pr_err("Failed to create nvme kobject\n");
++		return -ENOMEM;
++	}
++
++	ret = sysfs_create_file(nvme_kobj, &disable_attr.attr);
++	if (ret)
++		pr_err("Failed to create sysfs file: disable\n");
++	ret = sysfs_create_file(nvme_kobj, &switch_cnt_attr.attr);
++	if (ret)
++		pr_err("Failed to create sysfs file: switch_cnt\n");
++	ret = sysfs_create_file(nvme_kobj, &coalesce_value_attr.attr);
++	if (ret)
++		pr_err("Failed to create sysfs file: coalesce_value\n");
++	ret = sysfs_create_file(nvme_kobj, &hit_count_before_change_attr.attr);
++	if (ret)
++		pr_err("Failed to create sysfs file: hit_count_before_change\n");
++	ret = sysfs_create_file(nvme_kobj, &high_io_delta_attr.attr);
++	if (ret)
++		pr_err("Failed to create sysfs file: high_io_delta\n");
++	ret = sysfs_create_file(nvme_kobj, &scan_interval_attr.attr);
++	if (ret)
++		pr_err("Failed to create sysfs file: scan_interval\n");
++	ret = sysfs_create_file(nvme_kobj, &check_interval_attr.attr);
++	if (ret)
++		pr_err("Failed to create sysfs file: check_interval\n");
++	ret = sysfs_create_file(nvme_kobj, &min_running_queues_attr.attr);
++	if (ret)
++		pr_err("Failed to create sysfs file: min_running_queues\n");
++
+ 	BUILD_BUG_ON(sizeof(struct nvme_create_cq) != 64);
+ 	BUILD_BUG_ON(sizeof(struct nvme_create_sq) != 64);
+ 	BUILD_BUG_ON(sizeof(struct nvme_delete_queue) != 64);
+@@ -3301,6 +3651,16 @@ static void __exit nvme_exit(void)
+ {
+ 	pci_unregister_driver(&nvme_driver);
+ 	flush_workqueue(nvme_wq);
++
++	sysfs_remove_file(nvme_kobj, &disable_attr.attr);
++	sysfs_remove_file(nvme_kobj, &switch_cnt_attr.attr);
++	sysfs_remove_file(nvme_kobj, &coalesce_value_attr.attr);
++	sysfs_remove_file(nvme_kobj, &hit_count_before_change_attr.attr);
++	sysfs_remove_file(nvme_kobj, &high_io_delta_attr.attr);
++	sysfs_remove_file(nvme_kobj, &scan_interval_attr.attr);
++	sysfs_remove_file(nvme_kobj, &check_interval_attr.attr);
++	sysfs_remove_file(nvme_kobj, &min_running_queues_attr.attr);
++	kobject_put(nvme_kobj);
+ }
+ 
+ MODULE_AUTHOR("Matthew Wilcox <willy@linux.intel.com>");
+-- 
+2.43.0
+

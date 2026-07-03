@@ -1,0 +1,529 @@
+From 4e14b103081cb53796be6c4395dfb7de09831c4f Mon Sep 17 00:00:00 2001
+From: Jun Zeng <jun1.zeng@intel.com>
+Date: Thu, 28 May 2026 16:50:33 +0800
+Subject: [PATCH] nvme-pci: adaptive interrupt coalescing
+
+Add adaptive interrupt coalescing to improve IOPS for high-throughput
+workloads. Monitor IO pressure periodically and enable/disable coalescing
+automatically based on IOPS, queue depth, and inflight IO thresholds.
+This feature is enabled by default, can be controlled through debugfs
+variable during runtime.
+
+Signed-off-by: Jun Zeng <jun1.zeng@intel.com>
+Signed-off-by: Liang Fang <liang.a.fang@intel.com>
+---
+ drivers/nvme/host/pci.c | 386 ++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 386 insertions(+)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index c0e63bf9a77e..cc9c45c6de1c 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -10,6 +10,7 @@
+ #include <linux/blk-mq.h>
+ #include <linux/blk-mq-pci.h>
+ #include <linux/blk-integrity.h>
++#include <linux/debugfs.h>
+ #include <linux/dmi.h>
+ #include <linux/init.h>
+ #include <linux/interrupt.h>
+@@ -19,6 +20,7 @@
+ #include <linux/mm.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
++#include <linux/notifier.h>
+ #include <linux/once.h>
+ #include <linux/pci.h>
+ #include <linux/suspend.h>
+@@ -160,6 +162,16 @@ struct nvme_dev {
+ 	unsigned int nr_allocated_queues;
+ 	unsigned int nr_write_queues;
+ 	unsigned int nr_poll_queues;
++
++	/* adaptive interrupt coalescing support: */
++	bool in_coalescing;
++	u32 coalesce_set_streak;
++	u32 coalesce_clear_streak;
++	unsigned long *active_q_bitmap;
++	u64 prev_coal_io_count;
++	u64 prev_coal_check_time;
++	struct delayed_work coalesce_work;
++	struct notifier_block coalesce_notifier;
+ };
+ 
+ static int io_queue_depth_set(const char *val, const struct kernel_param *kp)
+@@ -215,6 +227,8 @@ struct nvme_queue {
+ 	__le32 *dbbuf_sq_ei;
+ 	__le32 *dbbuf_cq_ei;
+ 	struct completion delete_done;
++	/* to count io number of this queue */
++	atomic64_t io_cnt;
+ };
+ 
+ union nvme_descriptor {
+@@ -871,6 +885,316 @@ static blk_status_t nvme_prep_rq(struct nvme_dev *dev, struct request *req)
+ 	return ret;
+ }
+ 
++/* definition and logic for adaptive interrupt coalescing */
++#define NVME_ADAPTIVE_COALESCING_ENABLE		0x0001
++#define NVME_ADAPTIVE_COALESCING_DISABLE	0x0002
++#define COAL_CHECK_INTERVAL_MS			100
++#define COAL_CHECK_IO_DELTA_THRESH		45000 /* 45k io num, in 100 ms */
++#define COAL_CHECK_STREAK_THRESH		5
++#define COAL_CHECK_AVG_INFLT_IO_THRESH		32
++#define COAL_CHECK_INFLT_IO_THRESH		256
++#define COAL_ACTIVE_Q_SAMPLE_INTERVAL		512
++#define COALESCE_SET_VALUE			0x10a
++#define COALESCE_CLEAR_VALUE			0x000
++
++static BLOCKING_NOTIFIER_HEAD(nvme_adaptive_coalesce_notifier_list);
++
++/* enable adaptive interrupt coalescing by default */
++static bool adaptive_coalescing_disabled;
++static u32 high_io_delta = COAL_CHECK_IO_DELTA_THRESH;
++static u32 avg_qd_threshold = COAL_CHECK_AVG_INFLT_IO_THRESH;
++static u32 total_inflight_io_threshold = COAL_CHECK_INFLT_IO_THRESH;
++
++static int nvme_set_irq_coalesce(struct nvme_ctrl *ctrl, u32 v)
++{
++	return nvme_set_features(ctrl, NVME_FEAT_IRQ_COALESCE, v, NULL, 0, NULL);
++}
++
++static int nvme_get_irq_coalesce(struct nvme_ctrl *ctrl, u32 *v)
++{
++	return nvme_get_features(ctrl, NVME_FEAT_IRQ_COALESCE, 0, NULL, 0, v);
++}
++
++static bool nvme_check_irq_coalesce_supported(struct nvme_ctrl *ctrl)
++{
++	u32 value;
++
++	if (nvme_get_irq_coalesce(ctrl, &value)) {
++		dev_info(ctrl->device, "interrupt coalescing not supported\n");
++		return false;
++	}
++	return true;
++}
++
++static int disable_adaptive_coalescing_show(void *data, u64 *val)
++{
++	*val = adaptive_coalescing_disabled;
++	return 0;
++}
++
++static int disable_adaptive_coalescing_store(void *data, u64 val)
++{
++	u32 v;
++	u32 old_val = adaptive_coalescing_disabled;
++
++	if (val != 0 && val != 1)
++		return -EINVAL;
++
++	v = val;
++	if (v == old_val)
++		return 0;
++
++	adaptive_coalescing_disabled = v;
++
++	if (v)
++		blocking_notifier_call_chain(&nvme_adaptive_coalesce_notifier_list,
++					     NVME_ADAPTIVE_COALESCING_DISABLE, NULL);
++	else
++		blocking_notifier_call_chain(&nvme_adaptive_coalesce_notifier_list,
++					     NVME_ADAPTIVE_COALESCING_ENABLE, NULL);
++
++	return 0;
++}
++DEFINE_DEBUGFS_ATTRIBUTE(disable_adaptive_coalescing_fops,
++			 disable_adaptive_coalescing_show,
++			 disable_adaptive_coalescing_store,
++			 "%llu\n");
++
++static int nvme_coalesce_work_cpu(struct nvme_dev *dev)
++{
++	int node = dev_to_node(dev->dev);
++	int cpu;
++
++	if (node != NUMA_NO_NODE && node_online(node)) {
++		cpu = cpumask_last(cpumask_of_node(node));
++		if (cpu < nr_cpu_ids)
++			return cpu;
++	}
++
++	cpu = cpumask_last(cpu_online_mask);
++	if (cpu < nr_cpu_ids)
++		return cpu;
++
++	return WORK_CPU_UNBOUND;
++}
++
++/*
++ * Check if coalescing should be enabled based on IO pressure.
++ * Returns true if high IO pressure is detected.
++ */
++static bool nvme_should_enable_coalesce(u64 io_delta, u64 time_interval,
++					u32 avg_inflight_io, u32 busy_queues)
++{
++	/* Check if IOPS exceeds threshold (adjusted for actual time interval) */
++	if (io_delta * COAL_CHECK_INTERVAL_MS * NSEC_PER_MSEC <=
++	    high_io_delta * time_interval)
++		return false;
++
++	/*
++	 * Enable coalescing when active queues are individually deep enough to
++	 * indicate a throughput-oriented workload.
++	 */
++	if (avg_inflight_io > avg_qd_threshold)
++		return true;
++
++	/*
++	 * Even when each active queue is relatively shallow, still enable
++	 * coalescing if the aggregate inflight IO across busy queues is high.
++	 */
++	return busy_queues * avg_inflight_io > total_inflight_io_threshold;
++}
++
++/* Update coalesce streak counters based on current IO pressure */
++static void nvme_update_coalesce_streak(struct nvme_dev *dev, bool should_enable)
++{
++	if (should_enable) {
++		dev->coalesce_set_streak++;
++		dev->coalesce_clear_streak = 0;
++	} else {
++		dev->coalesce_clear_streak++;
++		dev->coalesce_set_streak = 0;
++	}
++}
++
++/* Apply coalesce state change if streak threshold is reached */
++static void nvme_apply_coalesce_change(struct nvme_dev *dev)
++{
++	if (!dev->in_coalescing) {
++		if (dev->coalesce_set_streak <= COAL_CHECK_STREAK_THRESH)
++			return;
++
++		if (nvme_set_irq_coalesce(&dev->ctrl, COALESCE_SET_VALUE)) {
++			dev_warn_ratelimited(dev->ctrl.device,
++					     "set irq coalesce with value:%d failed.\n",
++					     COALESCE_SET_VALUE);
++			return;
++		}
++
++		dev->in_coalescing = true;
++		dev->coalesce_set_streak = 0;
++		dev->coalesce_clear_streak = 0;
++		return;
++	}
++
++	if (dev->coalesce_clear_streak <= COAL_CHECK_STREAK_THRESH)
++		return;
++
++	if (nvme_set_irq_coalesce(&dev->ctrl, COALESCE_CLEAR_VALUE)) {
++		dev_warn_ratelimited(dev->ctrl.device,
++				     "clear irq coalesce with value:%d failed.\n",
++				     COALESCE_CLEAR_VALUE);
++		return;
++	}
++
++	dev->in_coalescing = false;
++	dev->coalesce_set_streak = 0;
++	dev->coalesce_clear_streak = 0;
++}
++
++/* Collect IO statistics from all queues */
++static void nvme_collect_io_stats(struct nvme_dev *dev, u64 *io_delta,
++				  u32 *avg_inflight_io, u32 *busy_queues)
++{
++	struct nvme_queue *nvmeq;
++	u64 current_total_io = 0;
++	u64 total_inflight_io = 0;
++	unsigned int i;
++
++	*busy_queues = bitmap_weight(dev->active_q_bitmap, dev->nr_allocated_queues);
++	if (!*busy_queues) {
++		*io_delta = 0;
++		*avg_inflight_io = 0;
++		return;
++	}
++
++	/* Count avg queue depth of active queues */
++	for_each_set_bit(i, dev->active_q_bitmap, dev->nr_allocated_queues) {
++		nvmeq = &dev->queues[i];
++		total_inflight_io +=
++			(nvmeq->sq_tail - nvmeq->cq_head + nvmeq->q_depth) %
++			nvmeq->q_depth;
++	}
++	*avg_inflight_io = div_u64(total_inflight_io, *busy_queues);
++
++	/*
++	 * Count total IO from all queues. We cannot only loop active queues
++	 * because we need to calculate io_delta with prev_coal_io_count.
++	 */
++	for (i = dev->nr_allocated_queues - 1; i > 0; i--) {
++		nvmeq = &dev->queues[i];
++		current_total_io += atomic64_read(&nvmeq->io_cnt);
++	}
++
++	bitmap_clear(dev->active_q_bitmap, 0, dev->nr_allocated_queues);
++	*io_delta = current_total_io - dev->prev_coal_io_count;
++	dev->prev_coal_io_count = current_total_io;
++}
++
++static void nvme_adjust_coalesce(struct nvme_dev *dev)
++{
++	u64 now = ktime_get_ns();
++	u64 time_interval;
++	u64 io_delta;
++	u32 avg_inflight_io;
++	u32 busy_queues;
++	bool should_enable;
++
++	if (adaptive_coalescing_disabled) {
++		/* Force clear coalescing when disabled */
++		dev->coalesce_set_streak = 0;
++		dev->coalesce_clear_streak += COAL_CHECK_STREAK_THRESH;
++		dev_info(dev->ctrl.device, "clearing coalesce due to disable\n");
++		nvme_apply_coalesce_change(dev);
++		return;
++	}
++
++	nvme_collect_io_stats(dev, &io_delta, &avg_inflight_io, &busy_queues);
++	if (!busy_queues) {
++		dev->prev_coal_check_time = now;
++		return;
++	}
++
++	time_interval = now - dev->prev_coal_check_time;
++	dev->prev_coal_check_time = now;
++
++	should_enable = nvme_should_enable_coalesce(io_delta, time_interval,
++						    avg_inflight_io, busy_queues);
++	if (should_enable &&
++		!dev->in_coalescing && dev->coalesce_set_streak > (COAL_CHECK_STREAK_THRESH - 1)) {
++		dev_info(dev->ctrl.device, "set coalesce,  with up_cnt:%d, io_delta:"
++					 "%llu, time_interval:%llu ns, avg_inflight_io:%u, running_queues:%d\n",
++					 dev->coalesce_set_streak, io_delta,
++					 time_interval, avg_inflight_io, busy_queues);
++	} else if (!should_enable &&
++			dev->in_coalescing &&
++			dev->coalesce_clear_streak > (COAL_CHECK_STREAK_THRESH - 1)) {
++			dev_info(dev->ctrl.device, "clear coalesce, with down_cnt:%d, io_delta:"
++					 "%llu, time_interval:%llu ns,  avg_inflight_io:%u, running_queues:%d\n",
++					 dev->coalesce_clear_streak, io_delta,
++					 time_interval, avg_inflight_io, busy_queues);
++	}
++	nvme_update_coalesce_streak(dev, should_enable);
++	nvme_apply_coalesce_change(dev);
++}
++
++static void nvme_adjust_coalesce_work(struct work_struct *work)
++{
++	struct nvme_dev *dev = container_of(work, struct nvme_dev, coalesce_work.work);
++	/*
++	 * Schedule the delayed work on the last CPU of the NUMA node the disk
++	 * belongs to.
++	 */
++	int cpu = nvme_coalesce_work_cpu(dev);
++
++	if (adaptive_coalescing_disabled && !dev->in_coalescing)
++		return;
++
++	nvme_adjust_coalesce(dev);
++	schedule_delayed_work_on(cpu, &dev->coalesce_work,
++				 msecs_to_jiffies(COAL_CHECK_INTERVAL_MS));
++}
++
++static void nvme_mark_queue_active(struct nvme_queue *nvmeq, u16 sq_tail)
++{
++	if (adaptive_coalescing_disabled)
++		return;
++
++	/* ignore admin op */
++	if (nvmeq->qid == 0)
++		return;
++
++	/* Sample every COAL_ACTIVE_Q_SAMPLE_INTERVAL submissions. */
++	if ((sq_tail & (COAL_ACTIVE_Q_SAMPLE_INTERVAL - 1)) == 0 &&
++	    !test_bit(nvmeq->qid, nvmeq->dev->active_q_bitmap))
++		set_bit(nvmeq->qid, nvmeq->dev->active_q_bitmap);
++}
++
++static int nvme_pci_coalescing_notify(struct notifier_block *nb,
++				      unsigned long action, void *data)
++{
++	struct nvme_dev *dev =
++		container_of(nb, struct nvme_dev, coalesce_notifier);
++	/*
++	 * Schedule the delayed work on the last CPU of the NUMA node the disk
++	 * belongs to.
++	 */
++	int cpu = nvme_coalesce_work_cpu(dev);
++
++	switch (action) {
++	case NVME_ADAPTIVE_COALESCING_ENABLE:
++		if (nvme_check_irq_coalesce_supported(&dev->ctrl))
++			schedule_delayed_work_on(cpu, &dev->coalesce_work,
++						 msecs_to_jiffies(COAL_CHECK_INTERVAL_MS));
++		break;
++	case NVME_ADAPTIVE_COALESCING_DISABLE:
++		/* no need to do things now, the coalesce_work will exit automatically */
++		break;
++	default:
++		break;
++	}
++	return NOTIFY_OK;
++}
++
+ /*
+  * NOTE: ns is NULL when called on the admin queue.
+  */
+@@ -896,6 +1220,9 @@ static blk_status_t nvme_queue_rq(struct blk_mq_hw_ctx *hctx,
+ 	ret = nvme_prep_rq(dev, req);
+ 	if (unlikely(ret))
+ 		return ret;
++
++	nvme_mark_queue_active(nvmeq, nvmeq->sq_tail + 1);
++
+ 	spin_lock(&nvmeq->sq_lock);
+ 	nvme_sq_copy_cmd(nvmeq, &iod->cmd);
+ 	nvme_write_sq_db(nvmeq, bd->last);
+@@ -914,6 +1241,7 @@ static void nvme_submit_cmds(struct nvme_queue *nvmeq, struct request **rqlist)
+ 	while ((req = rq_list_pop(rqlist))) {
+ 		struct nvme_iod *iod = blk_mq_rq_to_pdu(req);
+ 
++		nvme_mark_queue_active(nvmeq, nvmeq->sq_tail + 1);
+ 		nvme_sq_copy_cmd(nvmeq, &iod->cmd);
+ 	}
+ 	nvme_write_sq_db(nvmeq, true);
+@@ -1036,6 +1364,8 @@ static inline void nvme_handle_cqe(struct nvme_queue *nvmeq,
+ 		return;
+ 	}
+ 
++	atomic64_inc(&nvmeq->io_cnt);
++
+ 	trace_nvme_sq(req, cqe->sq_head, nvmeq->sq_tail);
+ 	if (!nvme_try_complete_req(req, cqe->status, cqe->result) &&
+ 	    !blk_mq_add_to_batch(req, iob,
+@@ -1601,6 +1931,7 @@ static int nvme_alloc_queue(struct nvme_dev *dev, int qid, int depth)
+ 	nvmeq->cq_phase = 1;
+ 	nvmeq->q_db = &dev->dbs[qid * 2 * dev->db_stride];
+ 	nvmeq->qid = qid;
++	atomic64_set(&nvmeq->io_cnt, 0);
+ 	dev->ctrl.queue_count++;
+ 
+ 	return 0;
+@@ -2787,8 +3118,14 @@ static void nvme_pci_free_ctrl(struct nvme_ctrl *ctrl)
+ {
+ 	struct nvme_dev *dev = to_nvme_dev(ctrl);
+ 
++	/* First stop the coalesce work to prevent it from running */
++	cancel_delayed_work_sync(&dev->coalesce_work);
++	/* Then unregister the notifier so no new work can be scheduled */
++	blocking_notifier_chain_unregister(&nvme_adaptive_coalesce_notifier_list,
++					   &dev->coalesce_notifier);
+ 	nvme_free_tagset(dev);
+ 	put_device(dev->dev);
++	bitmap_free(dev->active_q_bitmap);
+ 	kfree(dev->queues);
+ 	kfree(dev);
+ }
+@@ -3067,6 +3404,12 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
+ 	INIT_WORK(&dev->ctrl.reset_work, nvme_reset_work);
+ 	mutex_init(&dev->shutdown_lock);
+ 
++	dev->in_coalescing = false;
++	dev->coalesce_set_streak = 0;
++	dev->coalesce_clear_streak = 0;
++	dev->prev_coal_io_count = 0;
++	dev->prev_coal_check_time = ktime_get_ns();
++
+ 	dev->nr_write_queues = write_queues;
+ 	dev->nr_poll_queues = poll_queues;
+ 	dev->nr_allocated_queues = nvme_max_io_queues(dev) + 1;
+@@ -3077,6 +3420,10 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
+ 
+ 	dev->dev = get_device(&pdev->dev);
+ 
++	dev->coalesce_notifier.notifier_call = nvme_pci_coalescing_notify;
++	blocking_notifier_chain_register(&nvme_adaptive_coalesce_notifier_list,
++					 &dev->coalesce_notifier);
++
+ 	quirks |= check_vendor_combination_bug(pdev);
+ 	if (!noacpi &&
+ 	    !(quirks & NVME_QUIRK_FORCE_NO_SIMPLE_SUSPEND) &&
+@@ -3114,9 +3461,18 @@ static struct nvme_dev *nvme_pci_alloc_dev(struct pci_dev *pdev,
+ 	 * a single integrity segment for the separate metadata pointer.
+ 	 */
+ 	dev->ctrl.max_integrity_segments = 1;
++	dev->active_q_bitmap = bitmap_zalloc_node(dev->nr_allocated_queues, GFP_KERNEL, node);
++	if (!dev->active_q_bitmap) {
++		nvme_uninit_ctrl(&dev->ctrl);
++		ret = -ENOMEM;
++		goto out_put_device;
++	}
++	INIT_DELAYED_WORK(&dev->coalesce_work, nvme_adjust_coalesce_work);
+ 	return dev;
+ 
+ out_put_device:
++	blocking_notifier_chain_unregister(&nvme_adaptive_coalesce_notifier_list,
++					   &dev->coalesce_notifier);
+ 	put_device(dev->dev);
+ 	kfree(dev->queues);
+ out_free_dev:
+@@ -3202,6 +3558,17 @@ static int nvme_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+ 	nvme_start_ctrl(&dev->ctrl);
+ 	nvme_put_ctrl(&dev->ctrl);
+ 	flush_work(&dev->ctrl.scan_work);
++	if (nvme_check_irq_coalesce_supported(&dev->ctrl)) {
++		if (!adaptive_coalescing_disabled) {
++			/*
++			 * Schedule the delayed work on the last CPU of the
++			 * NUMA node this NVMe disk belongs to.
++			 */
++			schedule_delayed_work_on(nvme_coalesce_work_cpu(dev),
++						 &dev->coalesce_work,
++						 msecs_to_jiffies(COAL_CHECK_INTERVAL_MS));
++		}
++	}
+ 	return 0;
+ 
+ out_disable:
+@@ -3676,8 +4043,25 @@ static struct pci_driver nvme_driver = {
+ 	.err_handler	= &nvme_err_handler,
+ };
+ 
++static struct dentry *nvme_dbg_root;
++
+ static int __init nvme_init(void)
+ {
++	/*
++	 * debugfs is not essential for driver functionality.
++	 * Don't check return values - debugfs API handles errors gracefully.
++	 */
++	nvme_dbg_root = debugfs_create_dir("nvme_pci", NULL);
++	debugfs_create_file("disable_adaptive_interrupt_coalescing",
++			    0644, nvme_dbg_root, NULL,
++			    &disable_adaptive_coalescing_fops);
++	debugfs_create_u32("high_io_delta", 0644, nvme_dbg_root,
++			   &high_io_delta);
++	debugfs_create_u32("avg_qd_threshold", 0644, nvme_dbg_root,
++			   &avg_qd_threshold);
++	debugfs_create_u32("total_inflight_io_threshold", 0644,
++			   nvme_dbg_root, &total_inflight_io_threshold);
++
+ 	BUILD_BUG_ON(sizeof(struct nvme_create_cq) != 64);
+ 	BUILD_BUG_ON(sizeof(struct nvme_create_sq) != 64);
+ 	BUILD_BUG_ON(sizeof(struct nvme_delete_queue) != 64);
+@@ -3693,6 +4077,8 @@ static void __exit nvme_exit(void)
+ {
+ 	pci_unregister_driver(&nvme_driver);
+ 	flush_workqueue(nvme_wq);
++
++	debugfs_remove_recursive(nvme_dbg_root);
+ }
+ 
+ MODULE_AUTHOR("Matthew Wilcox <willy@linux.intel.com>");
+-- 
+2.43.0
+

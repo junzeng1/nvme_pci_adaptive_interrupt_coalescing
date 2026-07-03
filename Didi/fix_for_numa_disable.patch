@@ -1,0 +1,44 @@
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 7a542ff93235..708520f21514 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1049,6 +1049,24 @@ static ssize_t scan_interval_store(struct kobject *kobj, struct kobj_attribute *
+ 	return ret ?: count;
+ }
+ 
++static int nvme_coalesce_work_cpu(struct nvme_dev *dev)
++{
++	int node = dev_to_node(dev->dev);
++	int cpu;
++
++	if (node != NUMA_NO_NODE && node_online(node)) {
++		cpu = cpumask_last(cpumask_of_node(node));
++		if (cpu < nr_cpu_ids)
++			return cpu;
++	}
++
++	cpu = cpumask_last(cpu_online_mask);
++	if (cpu < nr_cpu_ids)
++		return cpu;
++
++	return WORK_CPU_UNBOUND;
++}
++
+ static ssize_t min_running_queues_show(struct kobject *kobj, struct kobj_attribute *attr, char *buf) {
+ 	return sprintf(buf, "%d\n", min_running_queues);
+ }
+@@ -3148,12 +3166,13 @@ static unsigned long check_vendor_combination_bug(struct pci_dev *pdev)
+ static void nvme_async_probe(void *data, async_cookie_t cookie)
+ {
+ 	struct nvme_dev *dev = data;
++	int cpu = nvme_coalesce_work_cpu(dev);
+ 
+ 	flush_work(&dev->ctrl.reset_work);
+ 	flush_work(&dev->ctrl.scan_work);
+ 	if (nvme_check_irq_coalesce_supported(&dev->ctrl) &&
+ 		!unlikely(disable)) {
+-		schedule_delayed_work_on(cpumask_last(cpumask_of_node(dev_to_node(dev->dev))),
++		schedule_delayed_work_on(cpu,
+ 			&dev->coalesce_work, msecs_to_jiffies(scan_interval));
+ 	} else {
+ 		dev_warn(dev->ctrl.device, "irq coalesce feature not supported or not to enable"

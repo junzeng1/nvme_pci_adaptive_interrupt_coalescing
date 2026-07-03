@@ -1,0 +1,106 @@
+From 6b41fb1e5c718e131676439d77ac3f22fee4170d Mon Sep 17 00:00:00 2001
+From: Jun Zeng <jun1.zeng@intel.com>
+Date: Mon, 3 Nov 2025 15:49:37 +0800
+Subject: [PATCH 3/3] Adaptive NVME SSD interrupt coalescing
+
+check busy queue num before clearing the interrupt coalescing.
+
+Signed-off-by: Jun Zeng <jun1.zeng@intel.com>
+---
+ drivers/nvme/host/pci.c | 56 ++++++++++++++++++++++++++++++++---------
+ 1 file changed, 44 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/nvme/host/pci.c b/drivers/nvme/host/pci.c
+index 8f843fa38161..7ccc2fc39191 100644
+--- a/drivers/nvme/host/pci.c
++++ b/drivers/nvme/host/pci.c
+@@ -1148,6 +1148,32 @@ static bool record_and_check_busy_queues(struct nvme_queue *nvmeq, struct reques
+ 	return false;
+ }
+ 
++static bool check_busy_queues(struct nvme_queue *nvmeq)
++{
++	struct nvme_dev *dev = nvmeq->dev;
++	int i;
++	int busy_queue_num = 0;
++	ktime_t now = ktime_get();
++	s64 duration_ns;
++
++	for (i = 0; i < BUSY_QUEUE_CHECK_NUM; ++i)
++	{
++		if (dev->busy_queues[i].qid == 0xfff) {
++			continue;
++		}
++		duration_ns = ktime_to_ns(ktime_sub(now, dev->busy_queues[i].last_time));
++		if (duration_ns < 1000000000 /* 1000 ms */) {
++			++ busy_queue_num;
++		}
++	}
++
++	if (busy_queue_num > min_running_queues) {
++		return true;
++	}
++
++	return false;
++}
++
+ static inline void adjust_coalesce(struct nvme_queue *nvmeq, struct request *req, u16 sq_head, u16 sq_tail)
+ {
+ 	struct nvme_dev *dev = nvmeq->dev;
+@@ -1209,20 +1235,27 @@ static inline void adjust_coalesce(struct nvme_queue *nvmeq, struct request *req
+ 		}
+ 		/* lower threshold for big op */
+ 		int max_threshold = (req_size >= 8192) ? (max_coalesce_threshold>>1) : max_coalesce_threshold;
+-		if (dev->is_coalescing != 1 && ((inflight > max_threshold) || (completed > min_completed_threshold))) {
++		if ((inflight > max_threshold) || (completed > min_completed_threshold)) {
+ 			if (req_size <= 32768) { /* no coalescing for op larger than 32768 */
+ 				if (++nvmeq->up_cnt > hit_count_before_change) {
+-					if (record_and_check_busy_queues(nvmeq, req)) {
+-						if (schedule_task_set_coalesce(ctrl, coalesce_value)) {
+-							pr_info("set coalesce, name:%s, qid=%hu, with io size:%u, op:%s, up_cnt:%d, sq_tail:%u, sq_head:%u, inflight:%u, completed:%u\n",
+-							req->q->disk->disk_name, nvmeq->qid, blk_rq_bytes(req),
+-							rq_data_dir(req) == READ ? "read":"write", nvmeq->up_cnt, sq_tail, sq_head, inflight, completed);
+-							dev->is_coalescing = 1;
+-							switch_cnt++;
+-							nvmeq->last_time = ktime_get();
+-							nvmeq->up_cnt = 0;
++					if (dev->is_coalescing != 1) {
++						if (record_and_check_busy_queues(nvmeq, req)) {
++							if (schedule_task_set_coalesce(ctrl, coalesce_value)) {
++								pr_info("set coalesce, name:%s, qid=%hu, with io size:%u, op:%s, up_cnt:%d, sq_tail:%u, "
++									"sq_head:%u, inflight:%u, completed:%u\n",
++									req->q->disk->disk_name, nvmeq->qid, blk_rq_bytes(req),
++									rq_data_dir(req) == READ ? "read":"write", nvmeq->up_cnt, sq_tail,
++									sq_head, inflight, completed);
++								dev->is_coalescing = 1;
++								switch_cnt++;
++							}
+ 						}
++					} else {
++						/* just record/update the busy queue info. */
++						(void)record_and_check_busy_queues(nvmeq, req);
+ 					}
++					nvmeq->last_time = ktime_get();
++					nvmeq->up_cnt = 0;
+ 				}
+ 			}
+ 		} else {
+@@ -1235,14 +1268,13 @@ static inline void adjust_coalesce(struct nvme_queue *nvmeq, struct request *req
+ 		/* queues not so full, close coalesce interrupt */
+ 		if (dev->is_coalescing == 1 && (((inflight < min_coalesce_threshold) && (completed < min_completed_threshold))||
+ 			(req_size > 32768))) {
+-			if (++nvmeq->down_cnt > hit_count_before_change) {
++			if (++nvmeq->down_cnt > hit_count_before_change && !check_busy_queues(nvmeq)) {
+ 				if (schedule_task_set_coalesce(ctrl, 0)) {
+ 					pr_info("clear coalesce, name:%s, qid=%hu, with io size:%u, op:%s, down_cnt:%d, sq_tail:%u, sq_head:%u, inflight:%u, completed:%u.\n",
+ 						req->q->disk->disk_name, nvmeq->qid, blk_rq_bytes(req),
+ 						rq_data_dir(req) == READ ? "read":"write", nvmeq->down_cnt, sq_tail, sq_head, inflight, completed);
+ 					dev->is_coalescing = 0;
+ 					switch_cnt++;
+-					pr_debug("dev=%p, qid=%hu, disable_coalesce.\n", dev, nvmeq->qid);
+ 					nvmeq->down_cnt = 0;
+ 				}
+ 			}
+-- 
+2.43.0
+
